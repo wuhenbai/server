@@ -255,15 +255,18 @@ class ModelRepositoryManager::BackendLifeCycle {
 
   ~BackendLifeCycle() { map_.clear(); }
 
-  // Start loading model backends with specified versions asynchronously.
-  // If 'force_unload', all versions that are being served will
-  // be unloaded before loading the specified versions.
+  // Start loading model backend with specified versions asynchronously.
+  // The previously loaded versions will be unloaded once the async loads are
+  // completed, even if the versions failed to load.
   Status AsyncLoad(
       const std::string& repository_path, const std::string& model_name,
       const std::set<int64_t>& versions,
-      const inference::ModelConfig& model_config, bool force_unload = true,
+      const inference::ModelConfig& model_config,
       std::function<void(int64_t, ModelReadyState, size_t)> OnComplete =
           nullptr);
+
+  // Start unloading all versions of the model backend asynchronously.
+  Status AsyncUnload(const std::string& model_name);
 
   // Get specified model version's backend. Latest ready version will
   // be retrieved if 'version' is -1. Return error if the version specified is
@@ -589,10 +592,19 @@ Status
 ModelRepositoryManager::BackendLifeCycle::AsyncLoad(
     const std::string& repository_path, const std::string& model_name,
     const std::set<int64_t>& versions,
-    const inference::ModelConfig& model_config, bool force_unload,
+    const inference::ModelConfig& model_config,
     std::function<void(int64_t, ModelReadyState, size_t)> OnComplete)
 {
+  // FIXME replace previously loaded version
   LOG_VERBOSE(1) << "AsyncLoad() '" << model_name << "'";
+  if (versions.empty()) {
+    return Status(
+        Status::Code::INVALID_ARG,
+        "at least one version must be available under the version policy of "
+        "model '" +
+            model_name + "'");
+  }
+
   std::lock_guard<std::mutex> map_lock(map_mtx_);
   auto it = map_.find(model_name);
   if (it == map_.end()) {
@@ -610,16 +622,13 @@ ModelRepositoryManager::BackendLifeCycle::AsyncLoad(
   }
 
   Status status = Status::Success;
-  size_t affected_version_cnt =
-      force_unload ? it->second.size() : versions.size();
+  size_t affected_version_cnt = versions.size();
   for (auto& version_backend : it->second) {
     std::lock_guard<std::recursive_mutex> lock(version_backend.second->mtx_);
     if (versions.find(version_backend.first) != versions.end()) {
       version_backend.second->repository_path_ = repository_path;
       version_backend.second->model_config_ = model_config;
       version_backend.second->next_action_ = ActionType::LOAD;
-    } else if (force_unload) {
-      version_backend.second->next_action_ = ActionType::UNLOAD;
     }
 
     auto version = version_backend.first;
@@ -633,17 +642,35 @@ ModelRepositoryManager::BackendLifeCycle::AsyncLoad(
     }
     Status action_status = TriggerNextAction(model_name, version, backend_info);
     // Only care about status on unloading case
-    if (!action_status.IsOk() && versions.empty()) {
+    if (!action_status.IsOk()) {
       status = action_status;
     }
   }
+  return status;
+}
 
-  if (versions.empty()) {
-    return Status(
-        Status::Code::INVALID_ARG,
-        "at least one version must be available under the version policy of "
-        "model '" +
-            model_name + "'");
+Status
+ModelRepositoryManager::BackendLifeCycle::AsyncUnload(
+    const std::string& model_name)
+{
+  LOG_VERBOSE(1) << "AsyncUnload() '" << model_name << "'";
+  std::lock_guard<std::mutex> map_lock(map_mtx_);
+  auto it = map_.find(model_name);
+  if (it == map_.end()) {
+    it = map_.emplace(std::make_pair(model_name, VersionMap())).first;
+  }
+
+  Status status = Status::Success;
+  for (auto& version_backend : it->second) {
+    std::lock_guard<std::recursive_mutex> lock(version_backend.second->mtx_);
+    version_backend.second->next_action_ = ActionType::UNLOAD;
+
+    auto version = version_backend.first;
+    auto backend_info = version_backend.second.get();
+    Status action_status = TriggerNextAction(model_name, version, backend_info);
+    if (!action_status.IsOk()) {
+      status = action_status;
+    }
   }
 
   return status;
@@ -654,6 +681,7 @@ ModelRepositoryManager::BackendLifeCycle::TriggerNextAction(
     const std::string& model_name, const int64_t version,
     BackendInfo* backend_info)
 {
+  // FIXME not necessary
   LOG_VERBOSE(1) << "TriggerNextAction() '" << model_name << "' version "
                  << version << ": "
                  << std::to_string(backend_info->next_action_);
@@ -693,8 +721,6 @@ ModelRepositoryManager::BackendLifeCycle::Load(
     BackendInfo* backend_info)
 {
   LOG_VERBOSE(1) << "Load() '" << model_name << "' version " << version;
-  Status status = Status::Success;
-
   backend_info->next_action_ = ActionType::NO_ACTION;
 
   switch (backend_info->state_) {
@@ -723,7 +749,7 @@ ModelRepositoryManager::BackendLifeCycle::Load(
       break;
   }
 
-  return status;
+  return Status::Success;
 }
 
 Status
@@ -1057,11 +1083,7 @@ ModelRepositoryManager::PollAndUpdateInternal(bool* all_models_polled)
   UpdateDependencyGraph(added, deleted, modified);
 
   for (const auto& name : deleted) {
-    inference::ModelConfig model_config;
-    std::set<int64_t> versions;
-    std::string empty_path;
-    // Utilize "force_unload" of AsyncLoad()
-    backend_life_cycle_->AsyncLoad(empty_path, name, versions, model_config);
+    backend_life_cycle_->AsyncUnload(name);
   }
 
   // model loading / unloading error will be printed but ignored
@@ -1088,12 +1110,7 @@ ModelRepositoryManager::LoadModelByDependency()
     loaded_models.clear();
     // Unload invalid models first
     for (auto& invalid_model : set_pair.second) {
-      inference::ModelConfig model_config;
-      std::set<int64_t> versions;
-      std::string empty_path;
-      // Utilize "force_unload" of AsyncLoad()
-      backend_life_cycle_->AsyncLoad(
-          empty_path, invalid_model->model_name_, versions, model_config);
+      backend_life_cycle_->AsyncUnload(invalid_model->model_name_);
       LOG_ERROR << invalid_model->status_.AsString();
       invalid_model->loaded_versions_ = std::set<int64_t>();
       loaded_models.emplace(invalid_model);
@@ -1115,7 +1132,7 @@ ModelRepositoryManager::LoadModelByDependency()
       if (status.IsOk()) {
         status = backend_life_cycle_->AsyncLoad(
             repository_path, valid_model->model_name_, versions,
-            valid_model->model_config_, true,
+            valid_model->model_config_,
             [model_state](
                 int64_t version, ModelReadyState state,
                 size_t total_version_cnt) {
@@ -1299,11 +1316,7 @@ ModelRepositoryManager::LoadUnloadModels(
   // In all cases, should unload them and remove from 'infos_' explicitly.
   for (const auto& name : deleted) {
     infos_.erase(name);
-    inference::ModelConfig model_config;
-    std::set<int64_t> versions;
-    std::string empty_path;
-    // Utilize "force_unload" of AsyncLoad()
-    backend_life_cycle_->AsyncLoad(empty_path, name, versions, model_config);
+    backend_life_cycle_->AsyncUnload(name);
   }
 
   // Update dependency graph and load
@@ -1319,13 +1332,8 @@ Status
 ModelRepositoryManager::UnloadAllModels()
 {
   Status status;
-  // Reload an empty version list to cause the model to unload.
-  inference::ModelConfig model_config;
-  std::set<int64_t> versions;
-  std::string empty_path;
   for (const auto& name_info : infos_) {
-    Status unload_status = backend_life_cycle_->AsyncLoad(
-        empty_path, name_info.first, versions, model_config);
+    Status unload_status = backend_life_cycle_->AsyncUnload(name_info.first);
     if (!unload_status.IsOk()) {
       status = Status(
           Status::Code::INTERNAL,
